@@ -1,61 +1,116 @@
 export default async function handler(req, res) {
-  if (req.method !== 'POST') return res.status(405).json({ error: 'Method not allowed' });
+  if (req.method !== 'POST') {
+    return res.status(405).json({ error: 'Method not allowed' });
+  }
 
   try {
     const body = req.body || {};
-    const prompt = body.prompt || body.text || '';
-    if (!prompt) return res.status(400).json({ error: 'Missing prompt' });
+    const prompt = String(body.prompt || body.text || '').trim();
+    const context = String(body.context || '').trim();
+    const chatId = body.chat_id || body.telegram_chat_id || null;
 
-    const geminiKey = process.env.GEMINI_API_KEY || process.env.GOOGLE_GENERATIVE_AI_API_KEY || process.env.GOOGLE_API_KEY;
-    const openaiKey = process.env.OPENAI_API_KEY;
+    if (!prompt) {
+      return res.status(400).json({ error: 'Missing prompt' });
+    }
+
+    const geminiKey = process.env.GEMINI_API_KEY || process.env.GOOGLE_API_KEY;
+    if (!geminiKey) {
+      return res.status(500).json({
+        error: 'Gemini API key is not configured',
+        requiredEnv: 'GEMINI_API_KEY'
+      });
+    }
+
+    const model = process.env.GEMINI_MODEL || 'gemini-3.8-flash';
 
     const system = `You are the Vision & Passion Coach for IME VR.
-Turn a rough VR scene idea into a useful next-step conversation.
-Be concise, practical, and ask only the most important questions needed to define the scene.
+
+Your job is to guide the user through building a complete VR experience, one step at a time.
+Use the conversation context when it is provided. Never ask the user to repeat information already present in the context.
 Reply in the same language as the user.
-Do not generate video yet.`;
+Be concise, practical, and natural for Telegram.
+Do not generate video yet.
+When enough information has been collected, summarize the defined scene and identify the next concrete step.
+Do not invent missing user preferences; ask for them when they materially affect the scene.`;
 
-    if (geminiKey) {
-      const model = process.env.GEMINI_MODEL || 'gemini-2.5-flash';
-      const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent?key=${encodeURIComponent(geminiKey)}`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          systemInstruction: { parts: [{ text: system }] },
-          contents: [{ role: 'user', parts: [{ text: prompt }] }],
-          generationConfig: { temperature: 0.7, maxOutputTokens: 800 }
-        })
-      });
+    const userInput = context
+      ? `CONVERSATION CONTEXT:
+${context}
+
+NEW USER MESSAGE:
+${prompt}`
+      : prompt;
+
+    const maxAttempts = 3;
+    let lastStatus = 502;
+
+    for (let attempt = 0; attempt < maxAttempts; attempt++) {
+      const response = await fetch(
+        `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`,
+        {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'x-goog-api-key': geminiKey
+          },
+          body: JSON.stringify({
+            systemInstruction: { parts: [{ text: system }] },
+            contents: [{ role: 'user', parts: [{ text: userInput }] }],
+            generationConfig: {
+              temperature: 0.7,
+              maxOutputTokens: 1200
+            }
+          }),
+          signal: AbortSignal.timeout(30000)
+        }
+      );
+
       const data = await response.json();
-      if (!response.ok) return res.status(response.status).json({ error: 'Gemini request failed', details: data?.error?.message || data });
-      const answer = data?.candidates?.[0]?.content?.parts?.map(p => p.text || '').join('').trim() || '';
-      if (answer) return res.status(200).json({ status: 'ok', answer, model, provider: 'gemini', chat_id: body.chat_id || body.telegram_chat_id || null, scene_id: body.scene_id || null });
+
+      if (response.ok) {
+        const answer = data?.candidates?.[0]?.content?.parts
+          ?.map(part => part.text || '')
+          .join('')
+          .trim();
+
+        if (answer) {
+          return res.status(200).json({
+            status: 'ok',
+            answer,
+            model,
+            provider: 'gemini',
+            chat_id: chatId,
+            scene_id: body.scene_id || null
+          });
+        }
+
+        return res.status(502).json({
+          error: 'Gemini returned no text',
+          provider: 'gemini'
+        });
+      }
+
+      lastStatus = response.status;
+      const retryable = [429, 500, 502, 503, 504].includes(response.status);
+      if (!retryable || attempt === maxAttempts - 1) {
+        return res.status(response.status).json({
+          error: 'Gemini request failed',
+          provider: 'gemini',
+          status: response.status
+        });
+      }
+
+      await new Promise(resolve => setTimeout(resolve, 1000 * (2 ** attempt)));
     }
 
-    if (openaiKey) {
-      const model = process.env.OPENAI_MODEL || 'gpt-4o-mini';
-      const response = await fetch('https://api.openai.com/v1/chat/completions', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${openaiKey}` },
-        body: JSON.stringify({ model, messages: [{ role: 'system', content: system }, { role: 'user', content: prompt }], temperature: 0.7, max_tokens: 800 })
-      });
-      const data = await response.json();
-      if (!response.ok) return res.status(response.status).json({ error: 'OpenAI request failed', details: data?.error?.message || data });
-      const answer = data?.choices?.[0]?.message?.content?.trim() || '';
-      if (answer) return res.status(200).json({ status: 'ok', answer, model, provider: 'openai', chat_id: body.chat_id || body.telegram_chat_id || null, scene_id: body.scene_id || null });
-    }
-
-    const answer = `קיבלתי: “${prompt}”
-
-כדי לבנות את סצנת ה‑VR, נגדיר קודם 3 דברים:
-1. מה בדיוק רואים בסצנה?
-2. איזו אווירה ותחושה אתה רוצה?
-3. כמה זמן בערך נמשכת החוויה?
-
-תענה חופשי, ואני אמשיך לבנות איתך את הסצנה.`;
-
-    return res.status(200).json({ status: 'ok', answer, model: 'fallback-coach', provider: 'fallback', chat_id: body.chat_id || body.telegram_chat_id || null, scene_id: body.scene_id || null });
+    return res.status(lastStatus).json({
+      error: 'Gemini request failed',
+      provider: 'gemini'
+    });
   } catch (error) {
-    return res.status(500).json({ error: error.message });
+    return res.status(500).json({
+      error: 'Coach service failed',
+      detail: error?.message || 'Unknown error'
+    });
   }
 }
