@@ -8,6 +8,7 @@ export default async function handler(req, res) {
     const prompt = String(body.prompt || body.text || '').trim();
     const context = String(body.context || '').trim();
     const chatId = body.chat_id || body.telegram_chat_id || null;
+    const isStart = /^\\/start(?:@\\w+)?$/i.test(prompt);
 
     if (!prompt) {
       return res.status(400).json({ error: 'Missing prompt' });
@@ -33,13 +34,16 @@ Do not generate video yet.
 When enough information has been collected, summarize the defined scene and identify the next concrete step.
 Do not invent missing user preferences; ask for them when they materially affect the scene.`;
 
-    const userInput = context
+    const effectiveContext = isStart ? '' : context;
+    const userInput = effectiveContext
       ? `CONVERSATION CONTEXT:
-${context}
+${effectiveContext}
 
 NEW USER MESSAGE:
 ${prompt}`
-      : prompt;
+      : (isStart
+        ? 'Start a new VR scene-building session. Ask the user the three most important questions needed to define the scene.'
+        : prompt);
 
     const maxAttempts = 3;
     let lastStatus = 502;
